@@ -1,0 +1,11 @@
+# --- Python ---
+__pycache__/
+*.py[cod]
+.venv/
+
+# --- decant state & SECRETS — НЕ КОММИТИТЬ ---
+.profile/         # браузерная сессия: cookies, авторизация, 2FA
+.token            # секрет демона (вшит в букмарклет)
+.last_capture.md  # последняя пойманная страница
+captures/         # сохранённые захваты
+_test_out/        # артефакты смоук-теста

@@ -1,0 +1,6 @@
+#!/usr/bin/env bash
+# Convenience wrapper (macOS/Linux): run `./decant get <url>`, `./decant serve`, etc.
+# Windows users: use decant.cmd instead.
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+exec "$DIR/.venv/bin/python" "$DIR/decant.py" "$@"
