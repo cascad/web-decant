@@ -23,6 +23,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import decant  # shared session + extraction helpers
+import media   # image/diagram/video extraction
 
 HERE = Path(__file__).resolve().parent
 HOST = "127.0.0.1"
@@ -45,18 +46,24 @@ def get_token():
 
 
 def save_capture(url, html=None):
-    """Extract Markdown from live `html` (preferred) or by re-fetching `url`; persist + remember."""
+    """Extract Markdown from live `html` (preferred) or by re-fetching `url`; persist + remember.
+
+    Media (images/diagrams/video) is extracted only on the re-fetch path (it needs a live page);
+    the live-DOM path writes a flat <slug>.md as before.
+    """
+    cap = None
     if html:
-        final_url = url or ""
-        raw = html
-        page_title = None
+        final_url, raw, page_title, media_items = (url or ""), html, None, []
     else:
         with _fetch_lock:
-            final_url, raw, page_title = decant.fetch(url)
+            cap = decant.fetch(url, media_base=str(OUT_DIR))
+        final_url, raw, page_title, media_items = cap.final_url, cap.html, cap.title, cap.media
 
     body = decant.to_markdown(raw, final_url)
     meta = decant.extract_meta(raw, final_url)
     title = meta.get("title") or page_title or final_url
+    if media_items:
+        body = media.weave_media(body, media_items)
 
     doc = decant.build_frontmatter(
         final_url,
@@ -65,11 +72,18 @@ def save_capture(url, html=None):
     ) + "\n\n" + body.rstrip() + "\n"
 
     OUT_DIR.mkdir(parents=True, exist_ok=True)
-    name = decant.slugify(title or urllib.parse.urlparse(final_url).path)
-    path = OUT_DIR / f"{name}.md"
-    path.write_text(doc, encoding="utf-8")
+    if cap is not None and cap.page_dir:                       # media mode -> per-page folder
+        page_dir = Path(cap.page_dir)
+        page_dir.mkdir(parents=True, exist_ok=True)
+        path = page_dir / f"{cap.slug}.md"
+        path.write_text(doc, encoding="utf-8")
+        media.write_manifest(page_dir, final_url, title, media_items)
+    else:                                                      # flat (live-DOM path / no media)
+        path = OUT_DIR / f"{decant.slugify(title or urllib.parse.urlparse(final_url).path)}.md"
+        path.write_text(doc, encoding="utf-8")
     LAST_FILE.write_text(doc, encoding="utf-8")
     return {"ok": True, "title": title, "url": final_url, "file": str(path),
+            "media": sum(1 for m in media_items if m.get("file")),
             "words": len(body.split())}
 
 

@@ -25,6 +25,7 @@ import os
 import re
 import sys
 import urllib.parse
+from collections import namedtuple
 from pathlib import Path
 
 # --- configuration -----------------------------------------------------------
@@ -53,6 +54,10 @@ class NeedsLogin(Exception):
     """Raised when a fetch lands on a login / SSO wall instead of the target page."""
 
 
+# What fetch() returns. `media` is [] when extraction is off; slug always reflects the title.
+Capture = namedtuple("Capture", "final_url html title slug page_dir media")
+
+
 # --- session layer (persistent profile) --------------------------------------
 
 def _looks_like_login(url: str, html: str, title: str) -> bool:
@@ -78,12 +83,17 @@ def _launch_context(p, profile, *, headless, engine, channel):
 
 
 def fetch(url, *, profile=DEFAULT_PROFILE, engine=DEFAULT_ENGINE, channel=DEFAULT_CHANNEL,
-          headless=True, settle_ms=1500, timeout_ms=30_000):
-    """Render `url` in the persistent profile and return (final_url, html, title)."""
+          headless=True, settle_ms=1500, timeout_ms=30_000, media_base=None, min_size=64):
+    """Render `url` in the persistent profile; return a Capture.
+
+    When `media_base` is given, also extract images/diagrams/video into
+    `<media_base>/<slug>/media/` and return them in Capture.media.
+    """
     from playwright.sync_api import sync_playwright
 
     profile = Path(profile)
     profile.mkdir(parents=True, exist_ok=True)
+    media_items, page_dir = [], None
 
     with sync_playwright() as p:
         ctx = _launch_context(p, profile, headless=headless, engine=engine, channel=channel)
@@ -96,15 +106,21 @@ def fetch(url, *, profile=DEFAULT_PROFILE, engine=DEFAULT_ENGINE, channel=DEFAUL
                 pass  # SPAs often never go fully idle; the settle wait below covers it.
             if settle_ms:
                 page.wait_for_timeout(settle_ms)
-            html = page.content()
             title = page.title()
             final_url = page.url
+            slug = slugify(title or urllib.parse.urlparse(final_url).path)
+            if media_base is not None:
+                import media as media_mod
+                media_mod.autoscroll(page)
+                page_dir = Path(media_base) / slug
+                media_items = media_mod.extract_media(page, page_dir / "media", min_size=min_size)
+            html = page.content()
         finally:
             ctx.close()
 
     if _looks_like_login(final_url, html, title):
         raise NeedsLogin(final_url)
-    return final_url, html, title
+    return Capture(final_url, html, title, slug, str(page_dir) if page_dir else None, media_items)
 
 
 def interactive_login(url, *, profile=DEFAULT_PROFILE, engine=DEFAULT_ENGINE, channel=DEFAULT_CHANNEL):
@@ -150,6 +166,7 @@ def to_markdown(html, url):
         include_tables=True,
         include_formatting=True,
         include_comments=False,
+        include_images=True,
         favor_recall=True,
     )
     if md:
@@ -213,8 +230,9 @@ def cmd_login(args):
 
 
 def cmd_get(args):
+    media_base = args.out if (args.out and not args.no_media and not args.raw) else None
     try:
-        final_url, html, title = fetch(
+        cap = fetch(
             args.url,
             profile=args.profile,
             engine=args.engine,
@@ -222,6 +240,8 @@ def cmd_get(args):
             headless=not args.no_headless,
             settle_ms=args.settle,
             timeout_ms=args.timeout,
+            media_base=media_base,
+            min_size=args.media_min,
         )
     except NeedsLogin as exc:
         print(
@@ -231,11 +251,14 @@ def cmd_get(args):
         )
         return 2
 
-    meta = extract_meta(html, final_url)
-    title = meta.get("title") or title
-    body = html if args.raw else to_markdown(html, final_url)
+    meta = extract_meta(cap.html, cap.final_url)
+    title = meta.get("title") or cap.title
+    body = cap.html if args.raw else to_markdown(cap.html, cap.final_url)
+    if cap.media and not args.raw:
+        import media as media_mod
+        body = media_mod.weave_media(body, cap.media)
     doc = build_frontmatter(
-        final_url,
+        cap.final_url,
         title,
         {"author": meta.get("author"), "date": meta.get("date"), "sitename": meta.get("sitename")},
     ) + "\n\n" + body.rstrip() + "\n"
@@ -243,12 +266,20 @@ def cmd_get(args):
     sys.stdout.buffer.write(doc.encode("utf-8", "replace"))
 
     if args.out:
-        outdir = Path(args.out)
-        outdir.mkdir(parents=True, exist_ok=True)
-        name = slugify(title or urllib.parse.urlparse(final_url).path)
-        path = outdir / f"{name}.md"
-        path.write_text(doc, encoding="utf-8")
-        print(f"\n[decant] wrote {path}", file=sys.stderr)
+        if cap.page_dir:  # media mode -> per-page folder
+            page_dir = Path(cap.page_dir)
+            page_dir.mkdir(parents=True, exist_ok=True)
+            (page_dir / f"{cap.slug}.md").write_text(doc, encoding="utf-8")
+            import media as media_mod
+            media_mod.write_manifest(page_dir, cap.final_url, title, cap.media)
+            saved = sum(1 for m in cap.media if m.get("file"))
+            print(f"\n[decant] wrote {page_dir}  (.md + media/ {saved} file(s) + media.json)", file=sys.stderr)
+        else:
+            outdir = Path(args.out)
+            outdir.mkdir(parents=True, exist_ok=True)
+            path = outdir / f"{slugify(title or urllib.parse.urlparse(cap.final_url).path)}.md"
+            path.write_text(doc, encoding="utf-8")
+            print(f"\n[decant] wrote {path}", file=sys.stderr)
     return 0
 
 
@@ -284,11 +315,13 @@ def build_parser():
 
     g = sub.add_parser("get", help="fetch one page and print clean Markdown")
     g.add_argument("url")
-    g.add_argument("--out", help="directory to also write a <slug>.md file into")
+    g.add_argument("--out", help="dir to write into; with media -> <out>/<slug>/{<slug>.md, media/, media.json}")
     g.add_argument("--raw", action="store_true", help="emit raw HTML instead of Markdown")
     g.add_argument("--no-headless", action="store_true", help="show the browser window")
     g.add_argument("--settle", type=int, default=1500, help="extra ms to wait after load")
     g.add_argument("--timeout", type=int, default=30_000, help="navigation timeout (ms)")
+    g.add_argument("--no-media", action="store_true", help="skip image/diagram/video extraction")
+    g.add_argument("--media-min", type=int, default=64, help="min px size to treat an image as content")
     g.set_defaults(func=cmd_get)
 
     l = sub.add_parser("login", help="open a real window to authenticate once")
